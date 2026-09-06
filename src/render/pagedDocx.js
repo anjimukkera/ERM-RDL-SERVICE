@@ -54,6 +54,34 @@ const GRID_PRECISION_POINTS = 0.25;
 // band for that paragraph and table-border rounding; report content normally ends above the declared
 // bottom margin/footer. A PDF item that actually occupies this band fails closed below.
 const SECTION_ANCHOR_POINTS = 2;
+// The reflowable profile's Word default run size (half-points) and the single-spacing pitch Word gives a
+// line of that size. An empty editable cell receives that pitch, capped by its row budget, so text a user
+// types there is visible instead of vanishing inside the one-twip line the page-locked profile uses.
+const REFLOWABLE_DEFAULT_FONT_HALF_POINTS = 20;
+const WORD_SINGLE_LINE_FACTOR = 1.15;
+const REFLOWABLE_EMPTY_LINE_TWIPS = Math.round(
+  (REFLOWABLE_DEFAULT_FONT_HALF_POINTS / 2) * WORD_SINGLE_LINE_FACTOR * 20,
+);
+// Microsoft Word measures a line of embedded-font text slightly differently from the canonical PDF
+// renderer. Across the traced lines of real reports the difference ranged from a few points narrower to
+// about 1.5pt wider, independent of run boundaries and not proportional to the line length. The
+// page-locked profile pins every line with FitText; the reflowable profile cannot, because FitText would
+// squeeze text a user adds into the traced width. Instead a reflowable paragraph whose traced line has
+// less horizontal slack than this allowance extends its editable text area by the shortfall, on the side
+// away from its alignment, so that Word cannot wrap a line the PDF kept whole and grow the row by a line.
+// Text that fits still renders at its natural width, so an unedited page is unchanged.
+const WORD_LINE_MEASUREMENT_ALLOWANCE_POINTS = 3;
+const WORD_LINE_MEASUREMENT_ALLOWANCE_RATIO = 0.0025;
+// Word renders each horizontal rule charged to an `atLeast` row a fraction of a twip taller than its
+// declared thickness (measured 0.6 to 0.9 twips per 1pt to 2pt rule over 40-row tables). A page whose
+// grid fills the body area to the twip therefore overruns it by that fraction times the number of ruled
+// rows, and Word answers by pushing the last row onto an overflow page. Reserve one twip per ruled edge
+// when a flush grid is capped; the last row gives it up, which is invisible.
+const WORD_RULE_ROUNDING_TWIPS = 1;
+// Paragraph properties of every terminal paragraph Word requires after a story's last table: one exact
+// twip of line pitch and a hidden paragraph mark, which Word lays out with no vertical extent.
+const HIDDEN_TERMINAL_PARAGRAPH_PROPERTIES = '<w:spacing w:after="0" w:before="0" w:line="1" w:lineRule="exact"/>'
+  + '<w:rPr><w:vanish/></w:rPr>';
 const GEOMETRY_EPSILON = 0.13;
 const CERTIFIED_GEOMETRY_TOLERANCE_POINTS = 0.5;
 const NONE_BORDER = Object.freeze({ style: BorderStyle.NONE, size: 0, color: 'auto' });
@@ -515,6 +543,190 @@ function wordBorder(border) {
   };
 }
 
+// `w:sz` is measured in eighths of a point, and a double rule paints two strokes plus the gap between them.
+function borderThicknessTwips(border) {
+  if (!border || border.style === BorderStyle.NONE) return 0;
+  const strokes = border.style === BorderStyle.DOUBLE ? 3 : 1;
+  return Math.round((Number(border.size || 0) / 8) * 20 * strokes);
+}
+
+function bandFor(placement, row) {
+  if (!placement) return null;
+  return { index: row - placement.startRow, count: placement.endRow - placement.startRow };
+}
+
+// Thickest rule on the lower edge of one grid row, across every cell that row shows.
+function rowBottomEdgeTwips(grid, row) {
+  let edge = 0;
+  let column = 0;
+  while (column < grid.xBoundaries.length - 1) {
+    const placement = grid.coverage[row][column];
+    if (placement && placement.startColumn !== column) {
+      column += 1;
+      continue;
+    }
+    const geometry = cellGeometry(grid, row, column, placement, bandFor(placement, row));
+    edge = Math.max(edge, borderThicknessTwips(geometry.borders.bottom));
+    column = placement ? placement.endColumn : column + 1;
+  }
+  return edge;
+}
+
+// One resolved description of a page-grid cell, shared by the Word row arithmetic below and the cell
+// builder so that both see the same margins and borders. Borders, background, and geometry are always
+// resolved against the item's whole traced box, never against the individual band, so a merge cannot
+// change what the canonical PDF painted.
+function cellGeometry(grid, row, column, placement, band = null) {
+  const rowSpan = placement ? placement.endRow - placement.startRow : 1;
+  const columnSpan = placement ? placement.endColumn - placement.startColumn : 1;
+  const owner = placement?.item || null;
+  const merged = Boolean(band) && band.count > 1;
+  const continuation = merged && band.index > 0;
+  const box = cellBox(grid, placement ? placement.startRow : row, column, rowSpan, columnSpan);
+  const borders = mergeBandBorders(resolvedCellBorders(box, owner, grid.decorators, grid.lines), band);
+  const firstBandTwips = placement
+    ? pointsToTwips(grid.yBoundaries[placement.startRow + 1] - grid.yBoundaries[placement.startRow])
+    : Infinity;
+  let margins = null;
+  if (!continuation) {
+    margins = owner ? cellMargins(owner, firstBandTwips) : {
+      top: 0, right: 0, bottom: 0, left: 0, marginUnitType: WidthType.DXA,
+    };
+  }
+  return {
+    owner,
+    columnSpan,
+    merged,
+    continuation,
+    box,
+    borders,
+    margins,
+    firstBandTwips,
+    // `plain` covers both an unowned gap cell and a single-band item: Word measures either as ordinary
+    // row content. `restart` is the first band of a vertical merge and `continue` every later band.
+    kind: continuation ? 'continue' : merged ? 'restart' : 'plain',
+  };
+}
+
+// Microsoft Word row arithmetic, measured in Word for Windows with synthetic tables. A row whose height
+// rule is `atLeast` renders at
+//
+//   max(published value, tallest ordinary cell content) + largest top+bottom cell-margin pair
+//   + thickest rule meeting at the horizontal edge above the row (+ the edge below it for the last row)
+//
+// An `exact` row renders at its published value regardless of content, margins, or borders. A vertical
+// merge charges its content against the sum of the region's published values and grows only the region's
+// last row; an `exact` last row therefore freezes the region. The one exception is a first band whose
+// every cell starts a merge: Word then measures that band as if the merged content were ordinary content,
+// unless the band is `exact`, which restores the region accounting.
+//
+// The reflowable profile publishes `atLeast` so that content a user adds grows the row, but an unedited
+// row has to occupy exactly its canonical PDF height or the page grid drifts and Word repaginates the
+// report differently from the PDF. Subtracting the margin and edge overhead from the traced height gives
+// that, and the returned budgets tell each cell how much content Word will accept before it grows.
+// `flowBudgetTwips` caps the grid's rendered height at the story band it must fit.
+function wordRowPlan(grid, flowBudgetTwips = null) {
+  const rowCount = grid.yBoundaries.length - 1;
+  const rows = [];
+  for (let row = 0; row < rowCount; row += 1) {
+    const cells = [];
+    let column = 0;
+    while (column < grid.xBoundaries.length - 1) {
+      const placement = grid.coverage[row][column];
+      if (placement && placement.startColumn !== column) {
+        column += 1;
+        continue;
+      }
+      cells.push(cellGeometry(grid, row, column, placement, bandFor(placement, row)));
+      column = placement ? placement.endColumn : column + 1;
+    }
+    rows.push({
+      tracedTwips: Math.max(1, pointsToTwips(grid.yBoundaries[row + 1] - grid.yBoundaries[row])),
+      marginTwips: Math.max(0, ...cells.map((cell) => (
+        cell.margins ? Math.max(0, cell.margins.top) + Math.max(0, cell.margins.bottom) : 0
+      ))),
+      topEdgeTwips: Math.max(0, ...cells.map((cell) => borderThicknessTwips(cell.borders.top))),
+      bottomEdgeTwips: Math.max(0, ...cells.map((cell) => borderThicknessTwips(cell.borders.bottom))),
+      degenerate: cells.length > 0 && cells.every((cell) => cell.kind === 'restart'),
+    });
+  }
+  rows.forEach((entry, row) => {
+    const edgeAbove = Math.max(entry.topEdgeTwips, row > 0 ? rows[row - 1].bottomEdgeTwips : 0);
+    const edgeBelow = row === rows.length - 1 ? entry.bottomEdgeTwips : 0;
+    const overhead = entry.marginTwips + edgeAbove + edgeBelow;
+    const atLeast = Math.floor(entry.tracedTwips - overhead);
+    // A band thinner than its own rules and margins cannot be published as `atLeast` at all: Word would
+    // render the overhead on top of a one-twip minimum and the page would grow by the difference.
+    if (entry.degenerate || atLeast < 1) {
+      entry.rule = HeightRule.EXACT;
+      entry.valueTwips = entry.tracedTwips;
+      entry.capacityTwips = Math.max(0, entry.tracedTwips - overhead);
+      entry.overheadTwips = 0;
+      entry.roundingTwips = 0;
+    } else {
+      entry.rule = HeightRule.ATLEAST;
+      entry.valueTwips = atLeast;
+      entry.capacityTwips = atLeast;
+      entry.overheadTwips = overhead;
+      entry.roundingTwips = (edgeAbove > 0 ? WORD_RULE_ROUNDING_TWIPS : 0)
+        + (edgeBelow > 0 ? WORD_RULE_ROUNDING_TWIPS : 0);
+    }
+  });
+  if (Number.isFinite(flowBudgetTwips)) {
+    let rendered = rows.reduce((sum, entry) => (
+      sum + entry.valueTwips + entry.overheadTwips + entry.roundingTwips
+    ), 0);
+    // Shave the excess from the bottom of the grid, never more than a row can give up; a row that is
+    // already at its one-twip minimum passes the remainder to the row above it.
+    for (let row = rows.length - 1; row >= 0 && rendered > flowBudgetTwips; row -= 1) {
+      const entry = rows[row];
+      const trim = Math.min(entry.valueTwips - 1, rendered - flowBudgetTwips);
+      if (trim <= 0) continue;
+      entry.valueTwips -= trim;
+      entry.capacityTwips = Math.max(0, entry.capacityTwips - trim);
+      rendered -= trim;
+    }
+  }
+  return {
+    rows,
+    // The content Word accepts from an item before it grows a row: the item's own row for a single band,
+    // the whole region for a vertical merge.
+    budgetFor(row, placement) {
+      const start = placement ? placement.startRow : row;
+      const end = placement ? placement.endRow : row + 1;
+      let budget = 0;
+      for (let index = start; index < end; index += 1) budget += rows[index].capacityTwips;
+      return budget;
+    },
+  };
+}
+
+// Shrinks a cell's paragraph spacing until Word will keep the row at its canonical height. The PDF box
+// clips at its bottom edge, so the trailing padding goes first, then the displaced leading padding, and
+// only then the line pitch, uniformly across every line so that all of the text stays legible.
+function fitSpacingToBudget(spacing, lineCounts, budgetTwips, topPaddingTwips, bottomPaddingTwips) {
+  const need = spacing.reduce((sum, entry, index) => (
+    sum + entry.before + entry.after + entry.line * lineCounts[index]
+  ), 0);
+  let excess = need - budgetTwips;
+  if (excess <= 0) return;
+  const last = spacing[spacing.length - 1];
+  const trailing = Math.min(excess, last.after, Math.max(0, bottomPaddingTwips));
+  last.after -= trailing;
+  excess -= trailing;
+  if (excess <= 0) return;
+  const first = spacing[0];
+  const leading = Math.min(excess, first.before, Math.max(0, topPaddingTwips));
+  first.before -= leading;
+  excess -= leading;
+  if (excess <= 0) return;
+  const pitchTotal = spacing.reduce((sum, entry, index) => sum + entry.line * lineCounts[index], 0);
+  const scale = pitchTotal > 0 ? Math.max(0, pitchTotal - excess) / pitchTotal : 0;
+  spacing.forEach((entry) => {
+    entry.line = Math.max(1, Math.floor(entry.line * scale));
+  });
+}
+
 function strongerBorder(left, right) {
   if (!left) return right || null;
   if (!right) return left;
@@ -523,17 +735,57 @@ function strongerBorder(left, right) {
   return rightWidth >= leftWidth ? right : left;
 }
 
-function linesForParagraphs(item, bottomPaddingTwips = 0, fitTextCounter = null, topPaddingTwips = 0) {
+// The extra editable width, in twips, a reflowable paragraph needs so that Word keeps each traced line
+// whole (see `WORD_LINE_MEASUREMENT_ALLOWANCE_POINTS`). Zero when every line already has that slack.
+function lineMeasurementIndentTwips(item, lines) {
+  const inner = Number(item.width || 0)
+    - Number(item.padding?.left || 0)
+    - Number(item.padding?.right || 0);
+  let need = 0;
+  for (const line of lines) {
+    const width = Number(line.width);
+    if (!Number.isFinite(width) || width <= 0) continue;
+    const allowance = WORD_LINE_MEASUREMENT_ALLOWANCE_POINTS + WORD_LINE_MEASUREMENT_ALLOWANCE_RATIO * width;
+    need = Math.max(need, allowance - (inner - width));
+  }
+  return need > 0 ? Math.ceil(pointsToTwips(need)) : 0;
+}
+
+// Extends the paragraph's text area away from its alignment edge so the visible text does not move.
+function measurementIndent(align, twips) {
+  if (align === AlignmentType.RIGHT) return { left: -twips };
+  if (align === AlignmentType.CENTER) {
+    const half = Math.ceil(twips / 2);
+    return { left: -half, right: -half };
+  }
+  return { right: -twips };
+}
+
+// `flow` is null for the page-locked profile. The reflowable profile passes the cell's Word content
+// budget (see `wordRowPlan`) and the pitch an empty cell should offer a user.
+function linesForParagraphs(
+  item,
+  bottomPaddingTwips = 0,
+  fitTextCounter = null,
+  topPaddingTwips = 0,
+  flow = null,
+) {
   const source = item.lines || [];
-  if (source.length === 0) return [new Paragraph({
-    spacing: {
-      before: Math.max(0, topPaddingTwips),
-      after: Math.max(0, bottomPaddingTwips),
-      line: 1,
-      lineRule: LineRuleType.EXACT,
-    },
-    children: [new TextRun({ text: '' })],
-  })];
+  if (source.length === 0) {
+    const before = Math.max(0, topPaddingTwips);
+    const after = Math.max(0, bottomPaddingTwips);
+    return [new Paragraph({
+      spacing: {
+        before,
+        after,
+        // The page-locked profile keeps an empty cell physically negligible. The reflowable profile gives
+        // it a real editable line, capped so that it still cannot grow the canonical row.
+        line: flow ? Math.max(1, Math.min(flow.emptyLineTwips, flow.budgetTwips - before - after)) : 1,
+        lineRule: LineRuleType.EXACT,
+      },
+      children: [new TextRun({ text: '' })],
+    })];
+  }
 
   const paragraphGroups = [];
   let current = [];
@@ -572,9 +824,34 @@ function linesForParagraphs(item, bottomPaddingTwips = 0, fitTextCounter = null,
     if (segment.length > 0) groups.push({ lines: segment, linePitchTwips: pitch });
   }
 
-  return groups.map((group, groupIndex) => {
+  const spacing = groups.map((group, groupIndex) => {
     const first = group.lines[0];
     const last = group.lines[group.lines.length - 1];
+    return {
+      before: Math.max(
+        0,
+        pointsToTwips(first.before || 0) + (groupIndex === 0 ? topPaddingTwips : 0),
+      ),
+      after: Math.max(
+        0,
+        pointsToTwips(last.after || 0)
+          + (groupIndex === groups.length - 1 ? bottomPaddingTwips : 0),
+      ),
+      line: group.linePitchTwips,
+    };
+  });
+  if (flow) {
+    fitSpacingToBudget(
+      spacing,
+      groups.map((group) => group.lines.length),
+      flow.budgetTwips,
+      topPaddingTwips,
+      bottomPaddingTwips,
+    );
+  }
+
+  return groups.map((group, groupIndex) => {
+    const first = group.lines[0];
     const runs = [];
     group.lines.forEach((line, lineIndex) => {
       const lineRuns = line.runs?.length ? line.runs : [{ text: '', font: {} }];
@@ -618,19 +895,15 @@ function linesForParagraphs(item, bottomPaddingTwips = 0, fitTextCounter = null,
           : textRun);
       });
     });
+    const align = alignment(first.alignment);
+    const indentTwips = flow ? lineMeasurementIndentTwips(item, group.lines) : 0;
     return new Paragraph({
-      alignment: alignment(first.alignment),
+      alignment: align,
+      indent: indentTwips > 0 ? measurementIndent(align, indentTwips) : undefined,
       spacing: {
-        before: Math.max(
-          0,
-          pointsToTwips(first.before || 0) + (groupIndex === 0 ? topPaddingTwips : 0),
-        ),
-        after: Math.max(
-          0,
-          pointsToTwips(last.after || 0)
-            + (groupIndex === groups.length - 1 ? bottomPaddingTwips : 0),
-        ),
-        line: group.linePitchTwips,
+        before: spacing[groupIndex].before,
+        after: spacing[groupIndex].after,
+        line: spacing[groupIndex].line,
         lineRule: LineRuleType.EXACT,
       },
       children: runs.length > 0 ? runs : [new TextRun({ text: '' })],
@@ -1072,9 +1345,15 @@ function isInvisibleRectangle(item) {
     && !Object.values(item.borders || {}).some(Boolean);
 }
 
+// The grid canvas is the story's text area: `originX`/`originY` locate it on the physical page and the
+// RDL page margins become real Word section margins around it, so Word's print pre-check sees the
+// margins the report declares. Content may still extend into the right margin (Word draws a wider
+// table past the margin), but never off the page.
 function preparePageGrid(page, {
   items = page.items,
+  originX = 0,
   originY = 0,
+  canvasWidth = page.width,
   canvasHeight = page.height,
   reserveSectionAnchor = true,
 } = {}) {
@@ -1093,16 +1372,20 @@ function preparePageGrid(page, {
   // derived right/bottom edge by another quarter point and turn two coincident PDF cells into a false
   // overlap in Word (or leave a false gap). This is the same edge-coalescing semantic the PDF trace uses.
   const canonicalBounds = new WeakMap();
+  // Horizontal edges snap on the physical page grid and only then move to the story origin, which is
+  // itself snapped, so every column boundary and coalescing decision is exactly what a page-origin grid
+  // produces: the text area merely starts at the section margin instead of at the page edge.
+  const gridOriginX = snap(originX);
   const normalized = items.map((item) => {
     const canonical = {
-      x: Number(item.x || 0),
+      x: Number(item.x || 0) - gridOriginX,
       y: Number(item.y || 0) - originY,
       width: Number(item.width || 0),
       height: Number(item.height || 0),
     };
-    const x = snap(canonical.x);
+    const x = snap(Number(item.x || 0)) - gridOriginX;
     const y = snap(canonical.y);
-    const right = snap(canonical.x + canonical.width);
+    const right = snap(Number(item.x || 0) + canonical.width) - gridOriginX;
     const bottom = snap(canonical.y + canonical.height);
     const normalizedItem = {
       ...item,
@@ -1110,6 +1393,16 @@ function preparePageGrid(page, {
       y,
       width: Math.max(0, right - x),
       height: Math.max(0, bottom - y),
+      // Text paint bounds are compared with the item box, so traced line and run abscissae move to the
+      // same story origin as the box.
+      lines: gridOriginX === 0 ? item.lines : (item.lines || []).map((line) => ({
+        ...line,
+        x: line.x === undefined ? line.x : Number(line.x) - gridOriginX,
+        runs: (line.runs || []).map((run) => ({
+          ...run,
+          x: run.x === undefined ? run.x : Number(run.x) - gridOriginX,
+        })),
+      })),
     };
     canonicalBounds.set(normalizedItem, canonical);
     return normalizedItem;
@@ -1134,7 +1427,7 @@ function preparePageGrid(page, {
 
   for (const item of normalized) {
     if (item.x < -GEOMETRY_EPSILON || item.y < -GEOMETRY_EPSILON
-      || item.x + item.width > page.width + GEOMETRY_EPSILON
+      || item.x + item.width > snap(page.width) - gridOriginX + GEOMETRY_EPSILON
       || item.y + item.height > maximumCanvasBottom + GEOMETRY_EPSILON) {
       unsupported('A PDF item falls outside the Word page canvas', {
         page: page.number,
@@ -1228,7 +1521,7 @@ function preparePageGrid(page, {
   // line that loses a sub-tolerance band still resolves onto the shared edge it decorates.
   const xAxis = pageGridAxis([
     0,
-    page.width,
+    snap(originX + canvasWidth) - gridOriginX,
     ...normalized.flatMap((item) => [item.x, item.x + item.width]),
   ], owners.map((item) => [snap(item.x), snap(item.x + item.width)]));
   const yAxis = pageGridAxis([
@@ -1302,10 +1595,13 @@ function preparePageGrid(page, {
   };
 }
 
+// Word requires a paragraph after the last table of every story. A hidden one takes no vertical space,
+// so a story table that closes flush on its band cannot push the body or spill onto a blank page. The
+// paragraph mark itself is hidden by `finalizePackage`, which is where the section paragraphs live.
 function emptyStoryParagraph() {
   return new Paragraph({
     spacing: { before: 0, after: 0, line: 1, lineRule: LineRuleType.EXACT },
-    children: [new TextRun({ text: '' })],
+    children: [new TextRun({ text: '', vanish: true })],
   });
 }
 
@@ -1364,7 +1660,9 @@ async function nativePageFooter(
 
   const grid = preparePageGrid(page, {
     items: layout.items,
+    originX: layout.region.x,
     originY: layout.region.y,
+    canvasWidth: layout.region.width,
     canvasHeight: layout.height,
     reserveSectionAnchor: false,
   });
@@ -1409,7 +1707,9 @@ async function nativePageHeader(
 
   const grid = preparePageGrid(page, {
     items: layout.items,
+    originX: layout.region.x,
     originY: layout.region.y,
+    canvasWidth: layout.region.width,
     canvasHeight: layout.height,
     reserveSectionAnchor: false,
   });
@@ -1497,21 +1797,17 @@ async function tableCellFor(
   chartCounter,
   fitTextCounter,
   band = null,
+  flow = null,
 ) {
-  const rowSpan = placement ? placement.endRow - placement.startRow : 1;
-  const columnSpan = placement ? placement.endColumn - placement.startColumn : 1;
-  const owner = placement?.item || null;
-  const merged = Boolean(band) && band.count > 1;
-  const continuation = merged && band.index > 0;
-  // Borders, background, and geometry are always resolved against the item's whole traced box, never
-  // against the individual band, so a merge cannot change what the canonical PDF painted.
-  const box = cellBox(grid, placement ? placement.startRow : row, column, rowSpan, columnSpan);
+  const {
+    owner, columnSpan, merged, continuation, box, borders: cellBorders, margins, firstBandTwips,
+  } = cellGeometry(grid, row, column, placement, band);
   if (continuation) {
     return new TableCell({
       width: { size: pointsToTwips(box.width), type: WidthType.DXA },
       columnSpan,
       verticalMerge: VerticalMergeType.CONTINUE,
-      borders: mergeBandBorders(resolvedCellBorders(box, owner, grid.decorators, grid.lines), band),
+      borders: cellBorders,
       shading: (() => {
         const fill = resolvedBackground(box, owner, grid.decorators);
         return fill ? { type: ShadingType.CLEAR, fill: cleanColor(fill), color: 'auto' } : undefined;
@@ -1526,12 +1822,6 @@ async function tableCellFor(
     0,
     pointsToTwips(owner?.padding?.bottom || 0),
   );
-  const firstBandTwips = placement
-    ? pointsToTwips(grid.yBoundaries[placement.startRow + 1] - grid.yBoundaries[placement.startRow])
-    : Infinity;
-  const margins = owner ? cellMargins(owner, firstBandTwips) : {
-    top: 0, right: 0, bottom: 0, left: 0, marginUnitType: WidthType.DXA,
-  };
   // Whatever `cellMargins` refused to put in `tcMar/top` is carried by the content instead, so the item
   // keeps the same inner box it had in the canonical PDF.
   const displacedTopPaddingTwips = owner && !topMarginFitsFirstBand(owner, firstBandTwips)
@@ -1552,13 +1842,17 @@ async function tableCellFor(
       config,
       tempDir,
       chartCounter.value++,
-      bottomPaddingTwips,
+      // The drawing floats, so only its one-twip anchor paragraph and the paddings it carries count as
+      // Word row content; keep those inside the row budget as well.
+      flow
+        ? Math.max(0, Math.min(bottomPaddingTwips, flow.budgetTwips - displacedTopPaddingTwips - 1))
+        : bottomPaddingTwips,
       displacedTopPaddingTwips,
       drawingBorderInsets(box, owner, grid.decorators, grid.lines),
     )];
   } else {
     children = owner
-      ? linesForParagraphs(owner, bottomPaddingTwips, fitTextCounter, displacedTopPaddingTwips)
+      ? linesForParagraphs(owner, bottomPaddingTwips, fitTextCounter, displacedTopPaddingTwips, flow)
       : [new Paragraph({
         spacing: { before: 0, after: 0, line: 1, lineRule: LineRuleType.EXACT },
         children: [new TextRun({ text: '' })],
@@ -1582,7 +1876,7 @@ async function tableCellFor(
     // only the physical direction painted by PDF and never re-evaluates report data independently.
     textDirection: owner ? wordTextDirection(owner.writingMode) || undefined : undefined,
     shading: background ? { type: ShadingType.CLEAR, fill: cleanColor(background), color: 'auto' } : undefined,
-    borders: mergeBandBorders(resolvedCellBorders(box, owner, grid.decorators, grid.lines), band),
+    borders: cellBorders,
     children,
   });
 }
@@ -1596,75 +1890,86 @@ async function pageTable(
   tempDir,
   chartCounter,
   fitTextCounter,
+  flowBudgetTwips = null,
 ) {
+  // The page-locked profile publishes every traced band as an exact Word row. The reflowable profile
+  // publishes Word's own row arithmetic instead, so that an unedited row still renders at its traced
+  // height while content a user adds can grow it (see `wordRowPlan`).
+  const plan = request.__docxReflowable === true ? wordRowPlan(grid, flowBudgetTwips) : null;
+  // Exact rows are published in whole twips, so a grid that closes flush on its band can sum to a twip
+  // or two more than the band itself. Word has no slack left with real margins, so that rounding excess
+  // comes out of the last row (never more than the row can give).
+  const lastRowIndex = grid.yBoundaries.length - 2;
+  let pageLockedRoundingTrim = 0;
+  if (!plan && Number.isFinite(flowBudgetTwips)) {
+    const total = grid.yBoundaries.slice(1).reduce((sum, value, index) => (
+      sum + Math.max(1, pointsToTwips(value - grid.yBoundaries[index]))
+    ), 0);
+    pageLockedRoundingTrim = Math.max(0, total - flowBudgetTwips);
+  }
   const rows = [];
   for (let row = 0; row < grid.yBoundaries.length - 1; row += 1) {
     const children = [];
     let column = 0;
     while (column < grid.xBoundaries.length - 1) {
       const placement = grid.coverage[row][column];
-      if (placement) {
-        if (placement.startColumn !== column) {
-          column += 1;
-          continue;
-        }
-        const cell = await tableCellFor(
-          grid,
-          row,
-          column,
-          placement,
-          resources,
-          model,
-          request,
-          config,
-          tempDir,
-          chartCounter,
-          fitTextCounter,
-          {
-            index: row - placement.startRow,
-            count: placement.endRow - placement.startRow,
-          },
-        );
-        children.push(cell);
-        column = placement.endColumn;
-      } else {
-        const cell = await tableCellFor(
-          grid,
-          row,
-          column,
-          null,
-          resources,
-          model,
-          request,
-          config,
-          tempDir,
-          chartCounter,
-          fitTextCounter,
-        );
-        children.push(cell);
+      if (placement && placement.startColumn !== column) {
         column += 1;
+        continue;
       }
+      const flow = plan && placement
+        ? { budgetTwips: plan.budgetFor(row, placement), emptyLineTwips: REFLOWABLE_EMPTY_LINE_TWIPS }
+        : null;
+      children.push(await tableCellFor(
+        grid,
+        row,
+        column,
+        placement,
+        resources,
+        model,
+        request,
+        config,
+        tempDir,
+        chartCounter,
+        fitTextCounter,
+        bandFor(placement, row),
+        flow,
+      ));
+      column = placement ? placement.endColumn : column + 1;
     }
     const tracedHeightTwips = Math.max(
       1,
       pointsToTwips(grid.yBoundaries[row + 1] - grid.yBoundaries[row]),
     );
+    const planned = plan?.rows[row];
+    // Word draws the bottom rule of a table's last row below that row, outside its exact height (top
+    // and inner rules add nothing). The page-locked last row therefore gives up that thickness so the
+    // story renders at exactly its traced height and the rule lands on the traced edge; the
+    // reflowable plan already carries the same edge as the last row's overhead.
+    const lastRowEdgeTwips = !planned && row === lastRowIndex
+      ? rowBottomEdgeTwips(grid, row) + pageLockedRoundingTrim
+      : 0;
     rows.push(new TableRow({
-      cantSplit: true,
-      height: {
-        value: tracedHeightTwips,
-        rule: HeightRule.EXACT,
-      },
+      // Reflowable Word intentionally lets a long edited row continue on the next physical page.
+      // Page-locked DOCX retains the canonical no-split page fragment behavior.
+      cantSplit: !planned || planned.rule === HeightRule.EXACT,
+      height: planned
+        ? { value: planned.valueTwips, rule: planned.rule }
+        : { value: Math.max(1, tracedHeightTwips - lastRowEdgeTwips), rule: HeightRule.EXACT },
       children,
     }));
   }
+  const columnWidths = grid.xBoundaries.slice(1).map((value, index) => (
+    pointsToTwips(value - grid.xBoundaries[index])
+  ));
   return new Table({
-    width: { size: pointsToTwips(grid.page.width), type: WidthType.DXA },
-    columnWidths: grid.xBoundaries.slice(1).map((value, index) => (
-      pointsToTwips(value - grid.xBoundaries[index])
-    )),
+    width: { size: columnWidths.reduce((sum, width) => sum + width, 0), type: WidthType.DXA },
+    columnWidths,
     margins: { top: 0, right: 0, bottom: 0, left: 0 },
     indent: { size: 0, type: WidthType.DXA },
+    // Both profiles keep the canonical column grid fixed. Autofit would let Word re-measure every column
+    // from its content and redraw the report's geometry on open; vertical reflow of edited text happens
+    // inside the fixed columns regardless, which is the only growth the reflowable profile promises.
     layout: TableLayoutType.FIXED,
     borders: TableBorders.NONE,
     rows,
@@ -1673,9 +1978,26 @@ async function pageTable(
 
 function pageProperties(page, index) {
   const landscape = page.width > page.height;
-  const bodyTop = Number(page.regions?.body?.y || 0);
+  const body = page.regions?.body || {};
+  const bodyTop = Number(body.y || 0);
+  // Snapped like the grid origin (see `preparePageGrid`), so margin plus grid reproduces the exact
+  // page-origin positions the page-locked profile is certified against.
+  const bodyLeft = snap(Number(body.x || 0));
+  const bodyRight = Math.max(
+    0,
+    page.width - snap(Number(body.x || 0) + Number(body.width ?? page.width - Number(body.x || 0))),
+  );
   const headerDistance = headerLayout(page)?.topDistance || 0;
   const footerDistance = footerLayout(page)?.bottomDistance || 0;
+  // The canonical body band ends where the PDF stopped placing body content. Everything below it - the
+  // page footer band and the RDL bottom margin - is a real Word bottom margin, so the footer story
+  // starts exactly on the body boundary and grown reflowable content cannot flow through it. Word's
+  // terminal paragraphs are hidden (see `finalizePackage`), so a grid closing flush on that boundary
+  // needs no extra room; the page-locked last row gives up only the bottom rule Word draws below it.
+  const bottomMargin = Math.max(
+    0,
+    page.height - Number(page.bodyBottom ?? page.regions?.footer?.y ?? page.height),
+  );
   return {
     type: index === 0 ? undefined : SectionType.NEXT_PAGE,
     page: {
@@ -1695,13 +2017,10 @@ function pageProperties(page, index) {
         // an opaque Word body table over the native header story, so headers appear to disappear even
         // though their relationships exist in the package.
         top: pointsToTwips(bodyTop),
-        right: 0,
-        // The canonical body grid already stops before the PDF footer. A small negative bottom margin
-        // gives Word's mandatory end-of-section paragraph a non-visible flow allowance below that fixed
-        // grid, instead of forcing a mathematically full final table row onto another physical page.
-        // Footer placement is governed independently by the exact w:footer distance below.
-        bottom: -pointsToTwips(SECTION_ANCHOR_POINTS),
-        left: 0,
+        // The RDL left/right margins are real Word margins; every story grid starts at the text area.
+        right: pointsToTwips(bodyRight),
+        bottom: pointsToTwips(bottomMargin),
+        left: pointsToTwips(bodyLeft),
         // The RDL PageHeader height controls the native header grid. Word's Header from Top is the
         // traced header band's physical offset from the page edge, which is the RDL top margin.
         header: pointsToTwips(headerDistance),
@@ -1836,12 +2155,26 @@ async function addFontVariants(buffer, embeddedFonts) {
       // otherwise-empty section paragraph after each page table, turning the intended one-twip anchor
       // into an 18pt line and pushing a near-full final row onto a new page. Page-locked output uses
       // explicit point/twip geometry throughout, so a document grid is both unnecessary and incorrect.
+      // The section paragraph's mark is hidden as well: a hidden paragraph takes no vertical space, so a
+      // page grid closing flush on the body boundary keeps its page. The last section stores its
+      // properties on the body, so it receives an explicit hidden paragraph after its page table.
       xml = xml
         .replace(/<w:docGrid\b[^>]*\/>/g, '')
         .replace(
           /<w:p><w:pPr>(?=<w:sectPr\b)/g,
-          '<w:p><w:pPr><w:spacing w:after="0" w:before="0" w:line="1" w:lineRule="exact"/>',
+          `<w:p><w:pPr>${HIDDEN_TERMINAL_PARAGRAPH_PROPERTIES}`,
+        )
+        .replace(
+          /<\/w:tbl>(?=<w:sectPr\b)/,
+          `</w:tbl><w:p><w:pPr>${HIDDEN_TERMINAL_PARAGRAPH_PROPERTIES}</w:pPr></w:p>`,
         );
+    } else {
+      // Header and footer stories end in `emptyStoryParagraph`; hide its mark the same way so a story
+      // table filling its band does not grow the story by one line and displace the body.
+      xml = xml.replace(
+        /<w:p><w:pPr><w:spacing w:after="0" w:before="0" w:line="1" w:lineRule="exact"\/><\/w:pPr>(<w:r><w:rPr><w:vanish\/><\/w:rPr>)/g,
+        `<w:p><w:pPr>${HIDDEN_TERMINAL_PARAGRAPH_PROPERTIES}</w:pPr>$1`,
+      );
     }
     zip.file(name, xml.replace(
       /(<wp:docPr\b[^>]*\bid=")\d+(")/g,
@@ -1870,7 +2203,9 @@ async function cleanupInternalArtifacts(files) {
   await Promise.all(Object.values(files).map((file) => fs.unlink(file).catch(() => {})));
 }
 
-export async function renderPagedEditableDocx(model, request, config, tempDir, telemetry) {
+export async function renderPagedEditableDocx(model, request, config, tempDir, telemetry, {
+  reflowable = false,
+} = {}) {
   config ||= loadConfig({ ...process.env, RDL_STRICT_FONTS: 'false' });
   const reportTelemetry = (phase, metrics = {}) => {
     try { telemetry?.(phase, metrics); } catch { /* Telemetry cannot affect canonical PDF or DOCX output. */ }
@@ -1923,9 +2258,15 @@ export async function renderPagedEditableDocx(model, request, config, tempDir, t
       embeddedFontBytes,
     });
     const resources = modelResources(model);
-    const canonicalRequest = { ...request, __canonicalPageCount: canonical.pageCount };
+    const canonicalRequest = {
+      ...request,
+      __canonicalPageCount: canonical.pageCount,
+      __docxReflowable: reflowable,
+    };
     const chartCounter = { value: 0 };
-    const fitTextCounter = { value: 1 };
+    // FitText is a page-locking mechanism: Word compresses a run to its traced PDF width. It must not
+    // be emitted for the SSRS-style profile, where manual text must preserve its normal font size.
+    const fitTextCounter = reflowable ? null : { value: 1 };
     const sections = [];
     for (const [index, page] of trace.pages.entries()) {
       // Header/footer items must not participate in body flow. Word always inserts a terminal paragraph after
@@ -1942,7 +2283,9 @@ export async function renderPagedEditableDocx(model, request, config, tempDir, t
         )),
         // The native body table flows inside Word's body area. Its coordinates are therefore relative
         // to the canonical body band, while the section top margin restores the absolute PDF position.
+        originX: Number(page.regions?.body?.x || 0),
         originY: Number(page.regions?.body?.y || 0),
+        canvasWidth: Number(page.regions?.body?.width || page.width),
         canvasHeight: page.height - Number(page.regions?.body?.y || 0),
       });
       const header = await nativePageHeader(
@@ -1978,6 +2321,10 @@ export async function renderPagedEditableDocx(model, request, config, tempDir, t
           workingTempDir,
           chartCounter,
           fitTextCounter,
+          pointsToTwips(
+            Number(page.bodyBottom ?? page.regions?.footer?.y ?? page.height)
+              - Number(page.regions?.body?.y || 0),
+          ),
         )],
       });
       if ((index + 1) % 25 === 0 || index + 1 === trace.pages.length) {
@@ -1995,7 +2342,9 @@ export async function renderPagedEditableDocx(model, request, config, tempDir, t
     const document = new Document({
       creator: 'RDL Converter Service',
       title: request.outputFileName || model.name,
-      description: 'Windows Word page-locked editable rendering derived from the canonical PDF layout trace',
+      description: reflowable
+        ? 'Windows Word reflowable editable rendering derived from the canonical PDF layout trace'
+        : 'Windows Word page-locked editable rendering derived from the canonical PDF layout trace',
       compatibilityModeVersion: 15,
       features: { updateFields: false },
       fonts: embeddedFonts.map((embedded) => ({
@@ -2005,10 +2354,12 @@ export async function renderPagedEditableDocx(model, request, config, tempDir, t
       styles: {
         default: {
           document: {
-            run: { font: 'Arial', size: 2 },
-            paragraph: {
-              spacing: { before: 0, after: 0, line: 1, lineRule: LineRuleType.EXACT },
-            },
+            // A one-point default is necessary to hide empty cells in the page-locked grid, but it makes
+            // user-entered text tiny. The reflowable profile uses a normal 10pt Word default instead.
+            run: { font: 'Arial', size: reflowable ? REFLOWABLE_DEFAULT_FONT_HALF_POINTS : 2 },
+            paragraph: reflowable
+              ? { spacing: { before: 0, after: 0 } }
+              : { spacing: { before: 0, after: 0, line: 1, lineRule: LineRuleType.EXACT } },
           },
         },
       },
@@ -2028,7 +2379,7 @@ export async function renderPagedEditableDocx(model, request, config, tempDir, t
       pageCount: canonical.pageCount,
       mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
       extension: 'docx',
-      layoutMode: 'windows-paged-editable',
+      layoutMode: reflowable ? 'windows-reflowable-editable' : 'windows-paged-editable',
       editableTextRatio: 1,
       canonicalPdfSha256: createHash('sha256').update(canonical.buffer).digest('hex'),
     };

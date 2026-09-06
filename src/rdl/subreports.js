@@ -152,7 +152,7 @@ export function resolveBundledSubreports(model, request, config) {
     if (item.type === 'Subreport') hasSubreports = true;
   });
   const output = String(request.output || '').toUpperCase();
-  const supportsBundledSubreports = ['PDF', 'DOCX_VISUAL', 'DOCX_EDITABLE'].includes(output)
+  const supportsBundledSubreports = ['PDF', 'DOCX_VISUAL', 'DOCX_EDITABLE', 'DOCX_REFLOWABLE'].includes(output)
     || (output === 'XLSX' && resolveExcelLayoutMode(request) === 'REPORT');
   if (hasSubreports && !supportsBundledSubreports) {
     throw new ServiceError(

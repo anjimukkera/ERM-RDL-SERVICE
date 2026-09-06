@@ -52,16 +52,26 @@ Both POST endpoints accept JSON/base64 and multipart requests. Render outputs ar
 - `DOCX_EDITABLE`: Windows-only page-locked native editable Word content constructed from the canonical
   PDF renderer's resolved layout trace. The PDF is an internal layout authority, not a page screenshot or an
   external PDF-to-Word conversion.
+- `DOCX_REFLOWABLE`: native editable Word content using the same resolved RDL trace but Word-growing rows
+  and normal editable font sizing; its page count can change when a user edits content. Unedited output
+  must still paginate exactly like the canonical PDF: rows publish Word's measured row arithmetic
+  (`atLeast` value plus cell margins plus the shared border edge equals the traced height), cell content is
+  budgeted so it cannot grow an unedited row, and tight traced lines receive a measurement allowance instead
+  of FitText.
+- Both Word profiles carry the RDL page margins as real positive section margins (Word's print check
+  flags zero or negative margins); each story grid spans only its text area at unchanged physical
+  positions, terminal paragraphs are hidden so a flush grid needs no extra room, and a page-locked last
+  row publishes its traced height minus the bottom rule Word draws below the table.
 - `DOCX_VISUAL`: PDF rendered internally, rasterized at 300 DPI, then packaged as exactly one full-page image per Word page.
 - `XLSX`: native Excel workbook (exceljs); tablixes become styled cell blocks with live typed numbers/dates.
 
-There is no `DOCX_FIXED_EDITABLE`. Do not reintroduce the former continuous/reflowable renderer,
-shape-per-line text, or full-page screenshots in `DOCX_EDITABLE`. It must use native Word tables and text,
-with declared RDL images and charts as drawings. `DOCX_VISUAL` remains the separate raster page-image mode.
+There is no `DOCX_FIXED_EDITABLE`. `DOCX_EDITABLE` must remain page-locked; `DOCX_REFLOWABLE` is the
+separate user-editing mode and must use native Word tables and text, never shape-per-line text or full-page
+screenshots. Declared RDL images and charts remain drawings. `DOCX_VISUAL` remains the separate raster page-image mode.
 
 `DOCX_EDITABLE` reports the numeric canonical PDF page count, `X-Docx-Layout-Mode:
-windows-paged-editable`, and `X-Docx-Editable-Text-Ratio`. PDF and visual DOCX also return numeric canonical
-page counts.
+windows-paged-editable`, and `X-Docx-Editable-Text-Ratio`. `DOCX_REFLOWABLE` reports the canonical page
+count before user edits and `X-Docx-Layout-Mode: windows-reflowable-editable`. PDF and visual DOCX also return numeric canonical page counts.
 
 Microsoft Word is not installed or invoked on the production server. The Linux service writes OOXML directly; Word is an authoritative release-certification viewer on a developer/QA workstation only.
 
@@ -228,7 +238,7 @@ visible strings, dimensions, column counts, row counts, or data values in produc
 
 Dynamic column groups (matrix / cross-tab) with column-hierarchy `TablixHeader` and `TablixCorner`, group
 header/footer subtotal rows, and recursive/parent (`Group/Parent`) row groups are implemented. Bundled,
-invocation-scoped subreports are supported in PDF, `DOCX_EDITABLE`, `DOCX_VISUAL`, and XLSX `REPORT`; XLSX
+invocation-scoped subreports are supported in PDF, `DOCX_EDITABLE`, `DOCX_REFLOWABLE`, `DOCX_VISUAL`, and XLSX `REPORT`; XLSX
 `DATA` subreports remain fail-closed. `Group/Variables` are resolved as `Variables!Name.Value` in the current row scope via
 `globals.variables`; `DomainScope` and `NaturalGroup` are acknowledged metadata. The `Aggregate()` function,
 charts beyond the supported set, maps, gauges, custom code, external resources, and other uncatalogued

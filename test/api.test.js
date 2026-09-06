@@ -185,6 +185,7 @@ test('renders all DOCX modes through the public API with explicit layout and edi
   const { app, tempRoot } = await application(context);
   const expected = {
     DOCX_EDITABLE: { layout: 'windows-paged-editable', ratio: '1', numericPages: true },
+    DOCX_REFLOWABLE: { layout: 'windows-reflowable-editable', ratio: '1', numericPages: true },
     DOCX_VISUAL: { layout: 'visual', ratio: '0', numericPages: true },
   };
   for (const output of Object.keys(expected)) {

@@ -13,7 +13,7 @@ import {
   fontEmbeddingEligibility,
   resolveFontFile,
 } from '../src/render/fonts.js';
-import { renderEditableDocx } from '../src/render/docx.js';
+import { renderEditableDocx, renderReflowableDocx } from '../src/render/docx.js';
 import { renderPdf } from '../src/render/pdf.js';
 import { analyzeWindowsWordCompatibility } from '../src/render/windowsWordCompatibility.js';
 
@@ -123,6 +123,399 @@ test('page-locked DOCX contains one native fixed page grid per PDF page and all 
   assert.equal(fontParts.length, 4);
 });
 
+// Reads the body tables of a Word document into the quantities Word's row arithmetic consumes: the
+// published row height and rule, and per cell its grid position, merge state, margins, horizontal border
+// thickness, and the paragraph content height (spacing before/after plus exact line pitch per line).
+function wordTableRows(documentXml) {
+  const attribute = (source, name) => Number((new RegExp(`w:${name}="(-?\\d+)"`).exec(source) || [0, 0])[1]);
+  const thickness = (borders, side) => {
+    const match = new RegExp(`<w:${side} w:val="(\\w+)"[^>]*w:sz="(\\d+)"`).exec(borders || '');
+    if (!match || match[1] === 'none' || match[1] === 'nil') return 0;
+    return Math.round((Number(match[2]) / 8) * 20 * (match[1] === 'double' ? 3 : 1));
+  };
+  return documentXml.split('<w:tbl>').slice(1).map((table) => (
+    table.split('</w:tbl>')[0].split(/<w:tr\b/).slice(1).map((row) => {
+      const height = /<w:trHeight w:val="(\d+)" w:hRule="(\w+)"/.exec(row);
+      let gridStart = 0;
+      const cells = row.split(/<w:tc>/).slice(1).map((cell) => {
+        const properties = cell.split('</w:tcPr>')[0];
+        const gridSpan = attribute(/<w:gridSpan[^>]*>/.exec(properties)?.[0] || '', 'val') || 1;
+        const margins = /<w:tcMar>.*?<\/w:tcMar>/.exec(properties)?.[0] || '';
+        const borders = /<w:tcBorders>.*?<\/w:tcBorders>/.exec(properties)?.[0] || '';
+        const content = [...cell.matchAll(/<w:p>(.*?)<\/w:p>/gs)].reduce((sum, paragraph) => {
+          const spacing = /<w:spacing [^>]*\/>/.exec(paragraph[1])?.[0] || '';
+          const lines = (paragraph[1].match(/<w:br\/>/g) || []).length + 1;
+          return sum + attribute(spacing, 'before') + attribute(spacing, 'after') + attribute(spacing, 'line') * lines;
+        }, 0);
+        const parsed = {
+          gridStart,
+          gridSpan,
+          vMerge: /<w:vMerge w:val="restart"\/>/.test(properties) ? 'restart' : /<w:vMerge\/>/.test(properties) ? 'continue' : null,
+          marginTop: attribute(/<w:top [^>]*>/.exec(margins)?.[0] || '', 'w'),
+          marginBottom: attribute(/<w:bottom [^>]*>/.exec(margins)?.[0] || '', 'w'),
+          topBorder: thickness(borders, 'top'),
+          bottomBorder: thickness(borders, 'bottom'),
+          content,
+          text: [...cell.matchAll(/<w:t(?:\s[^>]*)?>([^<]*)<\/w:t>/g)].map((match) => match[1]).join(''),
+        };
+        gridStart += gridSpan;
+        return parsed;
+      });
+      return { value: Number(height[1]), rule: height[2], cells };
+    })
+  ));
+}
+
+// Asserts the measured Microsoft Word row arithmetic on every reflowable body row: an `atLeast` row
+// renders at value + largest margin pair + thickest rule on the edge above it (plus the edge below it
+// for the last row), an `exact` row renders at its value, and both must equal the page-locked row that
+// the same canonical trace produced. Content must fit the budget Word compares it with, so that an
+// unedited row can never grow.
+function assertReflowableRowsMatchPageLocked(reflowableXml, pageLockedXml) {
+  const reflowableTables = wordTableRows(reflowableXml);
+  const pageLockedTables = wordTableRows(pageLockedXml);
+  assert.equal(reflowableTables.length, pageLockedTables.length);
+  let atLeastRows = 0;
+  reflowableTables.forEach((rows, tableIndex) => {
+    const pageLocked = pageLockedTables[tableIndex];
+    assert.equal(rows.length, pageLocked.length);
+    rows.forEach((row, rowIndex) => {
+      assert.equal(pageLocked[rowIndex].rule, 'exact');
+      // The page-locked last row gives up the bottom rule Word draws below it, so its traced height is
+      // the published exact value plus that rule.
+      const traced = pageLocked[rowIndex].value + (rowIndex === rows.length - 1
+        ? Math.max(...pageLocked[rowIndex].cells.map((cell) => cell.bottomBorder))
+        : 0);
+      const edgeAbove = Math.max(
+        ...row.cells.map((cell) => cell.topBorder),
+        rowIndex > 0 ? Math.max(...rows[rowIndex - 1].cells.map((cell) => cell.bottomBorder)) : 0,
+      );
+      const edgeBelow = rowIndex === rows.length - 1 ? Math.max(...row.cells.map((cell) => cell.bottomBorder)) : 0;
+      const margins = Math.max(...row.cells.map((cell) => cell.marginTop + cell.marginBottom));
+      if (row.rule === 'exact') {
+        assert.equal(row.value, traced, `table ${tableIndex} row ${rowIndex} exact height`);
+        return;
+      }
+      atLeastRows += 1;
+      assert.equal(row.rule, 'atLeast');
+      const rendered = row.value + margins + edgeAbove + edgeBelow;
+      assert.ok(
+        rendered <= traced && rendered >= traced - 1,
+        `table ${tableIndex} row ${rowIndex}: Word renders ${rendered} twips for a ${traced} twip canonical row`,
+      );
+      for (const cell of row.cells) {
+        if (cell.vMerge === 'continue') continue;
+        let budget = row.rule === 'exact' ? traced - margins - edgeAbove : row.value;
+        if (cell.vMerge === 'restart') {
+          for (let next = rowIndex + 1; next < rows.length; next += 1) {
+            const continuation = rows[next].cells.find((candidate) => candidate.gridStart === cell.gridStart);
+            if (continuation?.vMerge !== 'continue') break;
+            budget += rows[next].rule === 'exact' ? rows[next].value : rows[next].value;
+          }
+        }
+        assert.ok(
+          cell.content <= budget,
+          `table ${tableIndex} row ${rowIndex} cell "${cell.text}" needs ${cell.content} twips of ${budget}`,
+        );
+      }
+    });
+  });
+  assert.ok(atLeastRows > 0, 'the reflowable profile must publish growing rows');
+}
+
+async function documentXmlOf(rendered) {
+  return (await JSZip.loadAsync(rendered.buffer)).file('word/document.xml').async('string');
+}
+
+test('reflowable DOCX publishes Word row arithmetic so unedited rows keep their canonical height', async () => {
+  const rendered = await renderReflowableDocx(baseModel, { ...request, output: 'DOCX_REFLOWABLE' }, config);
+  const pageLocked = await renderEditableDocx(baseModel, { ...request, output: 'DOCX_EDITABLE' }, config);
+  const documentXml = await documentXmlOf(rendered);
+
+  assert.equal(rendered.layoutMode, 'windows-reflowable-editable');
+  assert.equal(rendered.pageCount, pageLocked.pageCount);
+  assert.doesNotMatch(documentXml, /<w:fitText\b/);
+  assert.match(documentXml, /<w:trHeight[^>]*w:hRule="atLeast"/);
+  // Both profiles keep the canonical column grid; only row growth differs.
+  assert.equal((documentXml.match(/<w:tblLayout w:type="fixed"\/>/g) || []).length, rendered.pageCount);
+  assert.match(documentXml, /<w:sz w:val="20"\/>/);
+  assertReflowableRowsMatchPageLocked(documentXml, await documentXmlOf(pageLocked));
+});
+
+function syntheticTextbox(overrides) {
+  const source = baseModel.body.items.find((item) => item.type === 'Textbox');
+  const item = structuredClone(source);
+  Object.assign(item, overrides);
+  item.paragraphs = [[{ ...item.paragraphs[0][0], value: overrides.value }]];
+  return item;
+}
+
+function withBorders(item, width = 1) {
+  for (const side of ['top', 'right', 'bottom', 'left']) {
+    item.style.borders[side] = { style: 'Solid', color: '#000000', width };
+  }
+  item.style.border = { style: 'Solid', color: '#000000', width };
+  return item;
+}
+
+test('reflowable DOCX compresses content SSRS clips rather than letting Word grow the canonical row', async () => {
+  // A non-growing textbox shorter than its own wrapped text: SSRS clips it at the box edge, and the
+  // canonical trace records two 14pt lines inside an 8pt box. Word must keep the 8pt row.
+  const clipped = structuredClone(baseModel);
+  clipped.body.items.push(syntheticTextbox({
+    name: 'ClippedBox', value: 'CLIPPED TEXT THAT IS TALLER THAN ITS BOX', left: 7.2, top: 120, width: 300, height: 8, canGrow: false,
+  }));
+  const rendered = await renderReflowableDocx(clipped, { ...request, output: 'DOCX_REFLOWABLE' }, config);
+  const documentXml = await documentXmlOf(rendered);
+  const pageLockedXml = await documentXmlOf(await renderEditableDocx(clipped, { ...request, output: 'DOCX_EDITABLE' }, config));
+  assertReflowableRowsMatchPageLocked(documentXml, pageLockedXml);
+
+  const row = wordTableRows(documentXml)[0].find((candidate) => candidate.cells.some((cell) => cell.text.includes('CLIPPED')));
+  const cell = row.cells.find((candidate) => candidate.text.includes('CLIPPED'));
+  assert.equal(row.rule, 'atLeast');
+  assert.equal(row.value + cell.marginTop, 160, 'the 8pt canonical row is preserved');
+  assert.ok(cell.content <= row.value, 'the clipped text fits the row budget');
+  // Every traced word is still present; only the line pitch was reduced.
+  assert.equal(cell.text, 'CLIPPED TEXT THAT IS TALLER THAN ITS BOX');
+  const clippedCell = documentXml.split('<w:tc>').find((chunk) => chunk.includes('>CLIPPED<'));
+  const pitch = Number(/<w:spacing[^>]*w:line="(\d+)" w:lineRule="exact"\/>/.exec(clippedCell)[1]);
+  assert.ok(pitch > 1 && pitch < Math.round(15.640625 * 20), `line pitch ${pitch} is compressed below the traced 14pt pitch`);
+});
+
+test('reflowable DOCX publishes bands thinner than their own rules as exact rows and gives empty cells an editable line', async () => {
+  const variant = structuredClone(baseModel);
+  // Two bordered boxes offset by half a point create a half-point band that carries a one-point rule;
+  // Word cannot publish that as `atLeast` because the rule alone is taller than the band.
+  variant.body.items.push(
+    withBorders(syntheticTextbox({ name: 'LeftBox', value: 'LeftBox', left: 7.2, top: 120, width: 150, height: 20, canGrow: false })),
+    withBorders(syntheticTextbox({ name: 'RightBox', value: 'RightBox', left: 200, top: 120.5, width: 150, height: 20, canGrow: false })),
+    withBorders(syntheticTextbox({ name: 'EmptyBox', value: '', left: 7.2, top: 160, width: 150, height: 20, canGrow: false })),
+  );
+  const rendered = await renderReflowableDocx(variant, { ...request, output: 'DOCX_REFLOWABLE' }, config);
+  const documentXml = await documentXmlOf(rendered);
+  const pageLockedXml = await documentXmlOf(await renderEditableDocx(variant, { ...request, output: 'DOCX_EDITABLE' }, config));
+  assertReflowableRowsMatchPageLocked(documentXml, pageLockedXml);
+
+  const rows = wordTableRows(documentXml)[0];
+  const thin = rows.filter((row) => row.value === 10);
+  assert.equal(thin.length, 2);
+  assert.ok(thin.every((row) => row.rule === 'exact'));
+  assert.ok(rows.filter((row) => row.rule === 'atLeast').length >= rows.length - 2);
+
+  // The empty textbox keeps its canonical row but offers a real line to type into, unlike the one-twip
+  // paragraph the page-locked profile uses for empty cells.
+  const emptyRow = rows.find((row) => row.cells.some((cell) => cell.vMerge !== 'continue' && cell.content > 1 && cell.text === '' && cell.topBorder > 0));
+  assert.ok(emptyRow, 'empty bordered textbox row is present');
+  const emptyCell = emptyRow.cells.find((cell) => cell.text === '' && cell.topBorder > 0 && cell.content > 1);
+  assert.ok(emptyCell.content >= 200 && emptyCell.content <= emptyRow.value, `empty cell content ${emptyCell.content} within ${emptyRow.value}`);
+});
+
+test('reflowable DOCX extends tight lines away from their alignment so Word cannot wrap a traced line', async () => {
+  // Measure the traced width of one line first, then size textboxes so that the line has almost no
+  // horizontal slack. Word may measure such a line a little wider than the PDF did; without extra
+  // editable width it would wrap the last word and grow the row.
+  const probeModel = structuredClone(baseModel);
+  probeModel.body.items.push(syntheticTextbox({
+    name: 'ProbeBox', value: 'Tight measurement line', left: 7.2, top: 150, width: 400, height: 20, canGrow: false,
+  }));
+  const probe = await renderPdf(probeModel, request, config, { captureLayoutTrace: true });
+  const probeLine = probe.layoutTrace.pages[0].items.find((item) => item.itemName === 'ProbeBox').lines[0];
+  const tightWidth = probeLine.width + 4 + 0.5; // 2pt padding either side plus half a point of slack
+
+  const variant = structuredClone(baseModel);
+  const tight = (name, textAlign, top) => {
+    const item = syntheticTextbox({ name, value: 'Tight measurement line', left: 7.2, top, width: tightWidth, height: 20, canGrow: false });
+    item.style.textAlign = textAlign;
+    item.paragraphs[0][0].style.textAlign = textAlign;
+    // The paragraph-level RDL style wins over the textbox style for alignment.
+    if (Array.isArray(item.paragraphStyles)) {
+      item.paragraphStyles = item.paragraphStyles.map((style) => ({ ...style, textAlign }));
+    }
+    return item;
+  };
+  variant.body.items.push(
+    tight('TightLeft', 'Left', 150),
+    tight('TightRight', 'Right', 175),
+    tight('TightCenter', 'Center', 200),
+    syntheticTextbox({ name: 'LooseBox', value: 'Tight measurement line', left: 7.2, top: 225, width: tightWidth + 40, height: 20, canGrow: false }),
+  );
+  const rendered = await renderReflowableDocx(variant, { ...request, output: 'DOCX_REFLOWABLE' }, config);
+  const documentXml = await documentXmlOf(rendered);
+  const paragraphFor = (text, xml = documentXml) => xml.split('<w:tc>').find((chunk) => chunk.includes(`>${text}<`)).split('</w:pPr>')[0];
+  const minimum = Math.ceil((3 + 0.0025 * probeLine.width - 0.5) * 20);
+
+  const left = /<w:ind w:right="(-\d+)"\/>/.exec(paragraphFor('Tight'))?.[1];
+  assert.ok(left && -Number(left) >= minimum, `left-aligned tight line extends to the right by at least ${minimum} twips`);
+  const tightCells = documentXml.split('<w:tc>').filter((chunk) => chunk.includes('>Tight<'));
+  assert.equal(tightCells.length, 4);
+  const indents = tightCells.map((chunk) => /<w:ind [^>]*\/>/.exec(chunk.split('</w:pPr>')[0])?.[0] || null);
+  assert.match(indents[0], /w:right="-\d+"/);
+  assert.doesNotMatch(indents[0], /w:left/);
+  assert.match(indents[1], /w:left="-\d+"/);
+  assert.doesNotMatch(indents[1], /w:right/);
+  assert.match(indents[2], /w:left="-\d+"/);
+  assert.match(indents[2], /w:right="-\d+"/);
+  assert.equal(indents[3], null, 'a line with generous slack keeps its natural text area');
+
+  // The page-locked profile pins lines with FitText and never needs the allowance.
+  const pageLockedXml = await documentXmlOf(await renderEditableDocx(variant, { ...request, output: 'DOCX_EDITABLE' }, config));
+  assert.doesNotMatch(pageLockedXml, /<w:ind /);
+  assert.match(pageLockedXml, /<w:fitText\b/);
+});
+
+test('both Word profiles carry the RDL page margins as section margins without moving any content', async () => {
+  // basic.rdl declares 0.5in margins on every side: Word must see them as real margins (its print check
+  // flags zero or negative margins), the page grid must span only the text area, and every item must
+  // keep the physical position a page-origin grid gave it.
+  const canonical = await renderPdf(baseModel, request, config, { captureLayoutTrace: true });
+  const page = canonical.layoutTrace.pages[0];
+  const marginTwips = Math.round(page.regions.body.x * 20);
+  assert.equal(marginTwips, 720);
+  for (const render of [renderEditableDocx, renderReflowableDocx]) {
+    const documentXml = await documentXmlOf(await render(baseModel, request, config));
+    const margins = /<w:pgMar [^>]*>/.exec(documentXml)[0];
+    assert.match(margins, new RegExp(`w:left="${marginTwips}"`));
+    assert.match(margins, new RegExp(`w:right="${Math.round((page.width - page.regions.body.x - page.regions.body.width) * 20)}"`));
+    assert.match(margins, new RegExp(`w:top="${Math.round(page.regions.body.y * 20)}"`));
+    assert.match(margins, new RegExp(`w:bottom="${Math.round((page.height - page.bodyBottom) * 20)}"`));
+    assert.doesNotMatch(margins, /w:(?:left|right|top|bottom)="(?:0|-\d+)"/);
+    const columns = [...documentXml.matchAll(/<w:gridCol w:w="(\d+)"\/>/g)].map((match) => Number(match[1]));
+    assert.equal(columns.reduce((sum, width) => sum + width, 0), Math.round(page.regions.body.width * 20));
+    assert.match(documentXml, new RegExp(`<w:tblW w:type="dxa" w:w="${columns.reduce((sum, width) => sum + width, 0)}"`));
+    // The title box starts 7.2pt inside the body: its column offset plus the margin is its page position
+    // on the quarter-point Word grid, exactly as a page-origin grid placed it.
+    const title = page.items.find((item) => item.itemName === 'TitleBox');
+    const gap = columns[0];
+    assert.equal(gap + marginTwips, Math.round(Math.round(title.x / 0.25) * 0.25 * 20));
+  }
+});
+
+test('page-locked DOCX lets its last row give up the bottom rule Word draws below the table', async () => {
+  // Word renders an exact-row table at the sum of its rows plus the bottom rule of its last row and
+  // nothing else, so a bordered last row publishes its traced height minus that rule and the story still
+  // renders at exactly its traced height.
+  const variant = structuredClone(baseModel);
+  variant.body.items.push(withBorders(syntheticTextbox({
+    name: 'LastBordered', value: 'LAST', left: 7.2, top: 200, width: 150, height: 20, canGrow: false,
+  }), 2));
+  const documentXml = await documentXmlOf(await renderEditableDocx(variant, { ...request, output: 'DOCX_EDITABLE' }, config));
+  const rows = wordTableRows(documentXml)[0];
+  const last = rows[rows.length - 1];
+  assert.ok(last.cells.some((cell) => cell.text === 'LAST'));
+  assert.equal(last.rule, 'exact');
+  assert.equal(Math.max(...last.cells.map((cell) => cell.bottomBorder)), 40);
+  assert.equal(last.value, 400 - 40);
+  // Inner rows keep their full traced height: Word draws their rules inside the exact height.
+  assert.ok(rows.slice(0, -1).every((row) => row.value > 0));
+});
+
+test('reflowable DOCX reserves Word rule rounding when a ruled grid fills the body band', async () => {
+  // Twenty bordered rows stacked to the body boundary: Word renders each 1pt rule a fraction of a twip
+  // tall, so the flush grid must give up at least one twip per ruled row at its last row while every
+  // other row keeps its exact traced arithmetic.
+  const ruled = structuredClone(baseModel);
+  ruled.body.items = [];
+  const bodyHeight = baseModel.page.height - baseModel.page.marginTop - baseModel.page.marginBottom;
+  const rowsCount = 20;
+  const rowHeight = bodyHeight / rowsCount;
+  for (let index = 0; index < rowsCount; index += 1) {
+    ruled.body.items.push(withBorders(syntheticTextbox({
+      name: `Ruled${index}`, value: `Row ${index}`, left: 7.2, top: index * rowHeight, width: 200, height: rowHeight, canGrow: false,
+    })));
+  }
+  const ruledRequest = { ...request, datasets: { Sales: [{ Name: 'Only', Amount: 1 }] } };
+  const canonical = await renderPdf(ruled, ruledRequest, config, { captureLayoutTrace: true });
+  assert.equal(canonical.pageCount, 1);
+  const page = canonical.layoutTrace.pages[0];
+  const bandTwips = Math.round((page.bodyBottom - page.regions.body.y) * 20);
+  const reflowableXml = await documentXmlOf(await renderReflowableDocx(ruled, { ...ruledRequest, output: 'DOCX_REFLOWABLE' }, config));
+  const rows = wordTableRows(reflowableXml)[0];
+  const rendered = rows.reduce((sum, row, index) => {
+    if (row.rule === 'exact') return sum + row.value;
+    const edgeAbove = Math.max(...row.cells.map((cell) => cell.topBorder), index > 0 ? Math.max(...rows[index - 1].cells.map((cell) => cell.bottomBorder)) : 0);
+    const edgeBelow = index === rows.length - 1 ? Math.max(...row.cells.map((cell) => cell.bottomBorder)) : 0;
+    return sum + row.value + Math.max(...row.cells.map((cell) => cell.marginTop + cell.marginBottom)) + edgeAbove + edgeBelow;
+  }, 0);
+  const ruledRows = rows.filter((row) => row.cells.some((cell) => cell.topBorder > 0 || cell.bottomBorder > 0)).length;
+  assert.ok(ruledRows >= rowsCount);
+  assert.ok(rendered <= bandTwips - ruledRows, `Word renders ${rendered} twips; the band is ${bandTwips} with ${ruledRows} ruled rows`);
+  assert.ok(rendered >= bandTwips - ruledRows - 2, 'no more than the rounding allowance is given up');
+});
+
+test('reflowable DOCX renders a body grid closing flush on the body boundary at exactly the band height', async () => {
+  // A non-growing textbox whose bottom edge lands exactly on the traced body boundary. The terminal
+  // paragraphs are hidden, so the grid may fill the whole band and must not exceed it by a twip.
+  const flush = structuredClone(baseModel);
+  const bodyHeight = baseModel.page.height - baseModel.page.marginTop - baseModel.page.marginBottom;
+  flush.body.items.push(syntheticTextbox({
+    name: 'FlushBox', value: 'FLUSH', left: 7.2, top: bodyHeight - 20, width: 200, height: 20, canGrow: false,
+  }));
+  // One detail row keeps the tablix at its declared height, so nothing below it is displaced.
+  const flushRequest = { ...request, datasets: { Sales: [{ Name: 'Only', Amount: 1 }] } };
+  const canonical = await renderPdf(flush, flushRequest, config, { captureLayoutTrace: true });
+  assert.equal(canonical.pageCount, 1);
+  const page = canonical.layoutTrace.pages[0];
+  const bandTwips = Math.round((page.bodyBottom - page.regions.body.y) * 20);
+  const reflowableXml = await documentXmlOf(await renderReflowableDocx(flush, { ...flushRequest, output: 'DOCX_REFLOWABLE' }, config));
+  const pageLockedXml = await documentXmlOf(await renderEditableDocx(flush, { ...flushRequest, output: 'DOCX_EDITABLE' }, config));
+  const pageLockedRows = wordTableRows(pageLockedXml)[0];
+  assert.equal(pageLockedRows.reduce((sum, row) => sum + row.value, 0), bandTwips, 'the canonical grid fills the body band');
+
+  const rows = wordTableRows(reflowableXml)[0];
+  const rendered = rows.reduce((sum, row, index) => {
+    if (row.rule === 'exact') return sum + row.value;
+    const edgeAbove = Math.max(
+      ...row.cells.map((cell) => cell.topBorder),
+      index > 0 ? Math.max(...rows[index - 1].cells.map((cell) => cell.bottomBorder)) : 0,
+    );
+    const edgeBelow = index === rows.length - 1 ? Math.max(...row.cells.map((cell) => cell.bottomBorder)) : 0;
+    return sum + row.value + Math.max(...row.cells.map((cell) => cell.marginTop + cell.marginBottom)) + edgeAbove + edgeBelow;
+  }, 0);
+  // The grid fills the band up to the one-twip rounding allowance of each ruled row (the tablix rows).
+  const ruledRows = rows.filter((row) => row.cells.some((cell) => cell.topBorder > 0 || cell.bottomBorder > 0)).length;
+  assert.ok(
+    rendered <= bandTwips && rendered >= bandTwips - ruledRows - 1,
+    `Word renders ${rendered} twips inside a ${bandTwips} twip band with ${ruledRows} ruled rows`,
+  );
+  const last = rows[rows.length - 1];
+  const flushCell = last.cells.find((cell) => cell.text === 'FLUSH');
+  assert.ok(flushCell.content <= last.value, 'the flush textbox content fits its row');
+});
+
+test('reflowable DOCX reserves the canonical footer band as a Word body boundary', async () => {
+  const footerModel = structuredClone(baseModel);
+  const source = baseModel.body.items.find((item) => item.type === 'Textbox');
+  footerModel.page.footer = {
+    height: 24,
+    printOnFirstPage: true,
+    printOnLastPage: true,
+    items: [{
+      ...structuredClone(source),
+      name: 'ReflowableFooter',
+      value: 'REFLOWABLE_FOOTER',
+      paragraphs: [['REFLOWABLE_FOOTER']],
+      left: 0,
+      top: 0,
+      width: 200,
+      height: 18,
+      canGrow: false,
+    }],
+  };
+  const canonical = await renderPdf(footerModel, request, config, { captureLayoutTrace: true });
+  const footer = canonical.layoutTrace.pages[0].regions.footer;
+  const expectedBottomMargin = Math.round((canonical.layoutTrace.pages[0].height - footer.y) * 20);
+
+  const rendered = await renderReflowableDocx(footerModel, { ...request, output: 'DOCX_REFLOWABLE' }, config);
+  const documentXml = await (await JSZip.loadAsync(rendered.buffer))
+    .file('word/document.xml').async('string');
+
+  assert.match(
+    documentXml,
+    new RegExp(`<w:pgMar\\b(?=[^>]*w:bottom="${expectedBottomMargin}")`),
+  );
+  assert.doesNotMatch(documentXml, /<w:pgMar\b(?=[^>]*w:bottom="-40")/);
+});
+
 test('page-locked DOCX preserves mixed PDF line pitches without inflating every wrapped Word line', async () => {
   const mixed = structuredClone(baseModel);
   mixed.page.header = null;
@@ -216,14 +609,22 @@ test('section anchors and footer terminators cannot snap page-locked geometry to
   const footerXml = await zip.file('word/footer1.xml').async('string');
 
   assert.doesNotMatch(documentXml, /<w:docGrid\b/);
-  assert.match(documentXml, /<w:pgMar\b(?=[^>]*w:bottom="-40")/);
+  // The footer band and RDL bottom margin are a real (positive) Word bottom margin: 20pt band + 36pt.
+  assert.match(documentXml, /<w:pgMar\b(?=[^>]*w:bottom="1120")/);
+  assert.doesNotMatch(documentXml, /<w:pgMar\b(?=[^>]*w:bottom="-)/);
+  // Every section paragraph is one exact twip with a hidden mark, so it needs no vertical room.
   assert.match(
     documentXml,
-    /<w:p><w:pPr><w:spacing w:after="0" w:before="0" w:line="1" w:lineRule="exact"\/><w:sectPr\b/,
+    /<w:p><w:pPr><w:spacing w:after="0" w:before="0" w:line="1" w:lineRule="exact"\/><w:rPr><w:vanish\/><\/w:rPr><w:sectPr\b/,
   );
   assert.match(
+    documentXml,
+    /<\/w:tbl><w:p><w:pPr><w:spacing w:after="0" w:before="0" w:line="1" w:lineRule="exact"\/><w:rPr><w:vanish\/><\/w:rPr><\/w:pPr><\/w:p><w:sectPr\b/,
+  );
+  // The footer story terminator is hidden too, so a footer table filling its band cannot grow the story.
+  assert.match(
     footerXml,
-    /<\/w:tbl><w:p><w:pPr><w:spacing w:after="0" w:before="0" w:line="1" w:lineRule="exact"\/><\/w:pPr>/,
+    /<\/w:tbl><w:p><w:pPr><w:spacing w:after="0" w:before="0" w:line="1" w:lineRule="exact"\/><w:rPr><w:vanish\/><\/w:rPr><\/w:pPr><w:r><w:rPr><w:vanish\/><\/w:rPr>/,
   );
 });
 
@@ -272,7 +673,9 @@ test('a near-full PDF page preserves traced row heights and uses only the non-vi
   // instead of adding an opaque spacer row that can cover the Word header story.
   assert.match(documentXml, /<w:trHeight w:val="3400" w:hRule="exact"\/>/);
   assert.match(documentXml, /<w:pgMar\b(?=[^>]*w:top="200")/);
-  assert.match(documentXml, /<w:pgMar\b(?=[^>]*w:bottom="-40")/);
+  // The footer band and RDL bottom margin are a real positive Word margin in both profiles.
+  const tracedPage = (await renderPdf(nearFull, request, config, { captureLayoutTrace: true })).layoutTrace.pages[0];
+  assert.match(documentXml, new RegExp(`<w:pgMar\\b(?=[^>]*w:bottom="${Math.round((tracedPage.height - tracedPage.bodyBottom) * 20)}")`));
 });
 
 test('multi-row PDF footer content is isolated in one native footer part outside body pagination', async () => {

@@ -1,6 +1,6 @@
 import { ServiceError } from '../errors.js';
 
-export const OUTPUTS = new Set(['PDF', 'DOCX_EDITABLE', 'DOCX_VISUAL', 'XLSX']);
+export const OUTPUTS = new Set(['PDF', 'DOCX_EDITABLE', 'DOCX_REFLOWABLE', 'DOCX_VISUAL', 'XLSX']);
 
 export async function renderDocument(model, request, config, tempDir, telemetry) {
   const output = String(request.output || '').toUpperCase();
@@ -21,6 +21,11 @@ export async function renderDocument(model, request, config, tempDir, telemetry)
     const { renderEditableDocx } = await import('./docx.js');
     reportTelemetry('renderer-module-loaded', { output });
     return renderEditableDocx(model, request, config, tempDir, telemetry);
+  }
+  if (output === 'DOCX_REFLOWABLE') {
+    const { renderReflowableDocx } = await import('./docx.js');
+    reportTelemetry('renderer-module-loaded', { output });
+    return renderReflowableDocx(model, request, config, tempDir, telemetry);
   }
   if (output === 'XLSX') {
     const { renderExcel } = await import('./excel.js');

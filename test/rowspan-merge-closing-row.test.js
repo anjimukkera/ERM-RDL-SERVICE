@@ -125,9 +125,14 @@ test('the grown closing row reaches editable Word and Excel', async () => {
   const closingRow = documentXml.split('<w:tr>').find((chunk) => chunk.includes(`>DETAIL_${DETAILS}<`));
   assert.ok(closingRow, 'the last spanned detail is written into a Word row');
   const rowHeight = Number(closingRow.match(/<w:trHeight w:val="(\d+)"/)?.[1]);
+  // When this row closes the page grid it publishes its traced height minus the bottom rule Word draws
+  // below the table (and up to two twips of whole-twip rounding), so compare the rendered height.
+  const bottomRule = Math.max(0, ...[...closingRow.matchAll(/<w:tcBorders>.*?<w:bottom w:val="(\w+)"[^>]*w:sz="(\d+)"/g)]
+    .map((match) => (match[1] === 'none' || match[1] === 'nil' ? 0 : Math.round((Number(match[2]) / 8) * 20))));
+  const renderedHeight = rowHeight + bottomRule;
   assert.ok(
-    Math.abs(rowHeight - grownTwips) <= 20,
-    `the Word row holding DETAIL_${DETAILS} must be the grown height (${grownTwips} twips), got ${rowHeight}`,
+    Math.abs(renderedHeight - grownTwips) <= 22,
+    `the Word row holding DETAIL_${DETAILS} must be the grown height (${grownTwips} twips), got ${renderedHeight}`,
   );
 
   // Excel has no pages and already grows the final row of a vertical span; assert the same shape holds so
