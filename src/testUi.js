@@ -3,6 +3,7 @@ import { randomBytes } from 'node:crypto';
 const OUTPUT_OPTIONS = [
   ['PDF', 'PDF', 'Fixed layout with selectable text'],
   ['DOCX_EDITABLE', 'Word · Windows Paged', 'PDF-locked native tables and editable text'],
+  ['DOCX_REFLOWABLE', 'Word · Reflowable', 'Native tables that grow when users edit text'],
   ['DOCX_VISUAL', 'Word · Visual', 'Exact PDF pages as images'],
   ['XLSX', 'Excel', 'Native cells and workbook formatting'],
 ];
@@ -248,7 +249,7 @@ export function testUiPage() {
         const response = await fetch('/v1/render', { method:'POST', body });
         if (!response.ok) throw new Error(await errorMessage(response));
         const blob = await response.blob();
-        const extensions = { PDF:'pdf', DOCX_EDITABLE:'docx', DOCX_VISUAL:'docx', XLSX:'xlsx' };
+        const extensions = { PDF:'pdf', DOCX_EDITABLE:'docx', DOCX_REFLOWABLE:'docx', DOCX_VISUAL:'docx', XLSX:'xlsx' };
         const fallback = (request.outputFileName || 'report') + '.' + extensions[request.output];
         const url = URL.createObjectURL(blob);
         const link = document.createElement('a');

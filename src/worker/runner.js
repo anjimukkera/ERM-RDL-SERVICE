@@ -166,18 +166,18 @@ export function estimateWorkerMemory(rdlBuffer, request, config) {
   const textBytes = datasetTextBytes(request);
   const dataValues = datasetValueCount(request);
   const output = String(request?.output || '').toUpperCase();
-  const pageLockedDocx = output === 'DOCX_EDITABLE';
-  const producesPdf = output === 'PDF' || output === 'DOCX_VISUAL' || pageLockedDocx;
+  const nativeDocx = output === 'DOCX_EDITABLE' || output === 'DOCX_REFLOWABLE';
+  const producesPdf = output === 'PDF' || output === 'DOCX_VISUAL' || nativeDocx;
   const fontFamilies = declaredFontFamilies(xml);
   const imageBytes = embeddedImageBytes(xml);
   const bundledBytes = bundledRdlBytes(request);
   const imageItems = declaredItemCount(xml, 'Image');
   const chartItems = declaredItemCount(xml, 'Chart');
-  const fontBytes = pageLockedDocx ? embeddedFontBytes(config, fontFamilies) : 0;
+  const fontBytes = nativeDocx ? embeddedFontBytes(config, fontFamilies) : 0;
   // DOCX creation holds decoded image bytes, raster working buffers, font parts, canonical PDF bytes,
   // layout-trace nodes, and the compressed OOXML package concurrently. Count the binary sources
   // independently instead of assuming dataset text predicts them.
-  const binaryWorkingSetBytes = pageLockedDocx
+  const binaryWorkingSetBytes = nativeDocx
     ? imageBytes
       + bundledBytes
       + fontBytes
@@ -189,12 +189,12 @@ export function estimateWorkerMemory(rdlBuffer, request, config) {
     textBytes / REFERENCE_TEXT_BYTES,
     producesPdf ? pageWidthPt / REFERENCE_PAGE_WIDTH_PT : 1,
     producesPdf ? maxTablixColumns / REFERENCE_COLUMNS : 1,
-    pageLockedDocx ? dataValues / REFERENCE_DATA_VALUES : 1,
-    pageLockedDocx ? binaryWorkingSetBytes / REFERENCE_BINARY_WORKING_SET_BYTES : 1,
+    nativeDocx ? dataValues / REFERENCE_DATA_VALUES : 1,
+    nativeDocx ? binaryWorkingSetBytes / REFERENCE_BINARY_WORKING_SET_BYTES : 1,
   );
   // PDF, trace nodes, the native Word page grid, JSZip, and full font variants coexist during packaging.
   // This is a workload-class multiplier, not a report identity/profile and therefore applies uniformly.
-  const docxPackagingScale = pageLockedDocx ? 1.75 + Math.min(0.75, fontFamilies.size * 0.05) : 1;
+  const docxPackagingScale = nativeDocx ? 1.75 + Math.min(0.75, fontFamilies.size * 0.05) : 1;
   const scale = baseScale * docxPackagingScale;
   const uncappedMb = Math.ceil((config.workerMemoryMb * scale) / MEMORY_STEP_MB) * MEMORY_STEP_MB;
   const memoryMb = Math.min(config.workerMemoryMaxMb || config.workerMemoryMb, Math.max(config.workerMemoryMb, uncappedMb));
@@ -209,16 +209,16 @@ export function estimateWorkerMemory(rdlBuffer, request, config) {
       datasetTextBytes: textBytes,
       datasetValueCount: dataValues,
       declaredFontFamilies: fontFamilies.size,
-      embeddedFontVariants: pageLockedDocx ? fontFamilies.size * 4 : 0,
+      embeddedFontVariants: nativeDocx ? fontFamilies.size * 4 : 0,
       embeddedFontBytes: fontBytes,
       embeddedImageBytes: imageBytes,
       declaredImageItems: imageItems,
       declaredChartItems: chartItems,
-      chartRasterWorkingBytes: pageLockedDocx ? chartItems * CHART_RASTER_WORKING_BYTES : 0,
-      imageRasterWorkingBytes: pageLockedDocx ? imageItems * IMAGE_RASTER_WORKING_BYTES : 0,
+      chartRasterWorkingBytes: nativeDocx ? chartItems * CHART_RASTER_WORKING_BYTES : 0,
+      imageRasterWorkingBytes: nativeDocx ? imageItems * IMAGE_RASTER_WORKING_BYTES : 0,
       bundledRdlBytes: bundledBytes,
       binaryWorkingSetBytes,
-      internalCanonicalPdf: pageLockedDocx,
+      internalCanonicalPdf: nativeDocx,
       docxPackagingScale,
       scale,
     },

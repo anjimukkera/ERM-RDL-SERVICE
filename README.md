@@ -73,7 +73,7 @@ npx rdl-converter-service            # if installed as a dependency
 | `GET` | `/readyz` | Writable temp storage, required font variants, PDFKit, and Poppler readiness. `503` when not ready. |
 | `GET` | `/` or `/test-ui` | Open end-to-end page for uploading one RDL plus its request JSON and downloading a selected output. |
 | `POST` | `/v1/analyze` | Namespace, page settings, parameters, exact dataset fields, fonts, detected constructs, structured-DOCX drift risks and fail-closed errors. **Does not render.** |
-| `POST` | `/v1/render` | One completed `PDF`, `DOCX_EDITABLE`, `DOCX_VISUAL`, or `XLSX` artifact. |
+| `POST` | `/v1/render` | One completed `PDF`, `DOCX_EDITABLE`, `DOCX_REFLOWABLE`, `DOCX_VISUAL`, or `XLSX` artifact. |
 
 ### Open test page
 
@@ -113,7 +113,7 @@ curl -X POST http://localhost:7070/v1/render \
 // request.json
 {
   "rdlBase64": "PD94bWwg…",
-  "output": "PDF",                      // PDF | DOCX_EDITABLE | DOCX_VISUAL | XLSX
+  "output": "PDF",                      // PDF | DOCX_EDITABLE | DOCX_REFLOWABLE | DOCX_VISUAL | XLSX
   "outputFileName": "combined-assurance",
   "parameters": { "ReportYear": 2026 },
   "datasets": {
@@ -146,7 +146,7 @@ curl -X POST http://localhost:7070/v1/render \
 `X-Docx-Layout-Mode` plus `X-Docx-Editable-Text-Ratio`. The artifact is rendered completely before any
 header is sent, so a `200` means a finished file.
 
-`PDF`, `DOCX_EDITABLE`, and `DOCX_VISUAL` return numeric canonical PDF page counts. `DOCX_EDITABLE` reports
+`PDF`, `DOCX_EDITABLE`, `DOCX_REFLOWABLE`, and `DOCX_VISUAL` return numeric canonical PDF page counts. `DOCX_EDITABLE` reports
 `X-Docx-Layout-Mode: windows-paged-editable`.
 
 ---
@@ -186,7 +186,7 @@ const converter = await createConverter();
 try {
   const rendered = await converter.render({
     rdl: await fs.readFile('report.rdl'),   // Buffer | Uint8Array | string
-    output: 'PDF',                          // PDF | DOCX_EDITABLE | DOCX_VISUAL | XLSX
+    output: 'PDF',                          // PDF | DOCX_EDITABLE | DOCX_REFLOWABLE | DOCX_VISUAL | XLSX
     parameters: { ReportYear: 2026 },
     datasets: {
       MainDataset: [{ RiskName: 'Vendor concentration', Rating: 3 }],
@@ -287,6 +287,7 @@ guaranteed temp cleanup. That isolation is a property of the pipeline, not of th
 | --- | --- | --- | --- |
 | `PDF` | Directly from the normalized RDL model. | Selectable | Exact |
 | `DOCX_EDITABLE` | Native OpenXML built from the canonical PDF renderer's resolved layout trace. It is not a screenshot or an external PDF conversion. | Editable | Canonical PDF count |
+| `DOCX_REFLOWABLE` | Native OpenXML from the same resolved RDL content, with growing Word rows and normal editable font sizing. | Editable and reflowable | Canonical PDF count before user edits |
 | `DOCX_VISUAL` | Renders PDF, rasterizes every page at 300 DPI, one full-page floating image per Word page. | Images | Exact |
 | `XLSX` | Native Excel workbook. The default `REPORT` layout creates one native-cell worksheet per explicit RDL section; `DATA` preserves the legacy stacked/per-tablix export. | Live cells | Not paginated (`null`) |
 
@@ -299,6 +300,18 @@ Windows; editing may change later pagination. Unsupported Word geometry fails cl
 The former continuous renderer, document profiles, and native-fragment switches have been removed.
 `docx.nativePageFragments`, `docxNativePageFragments`, `docx.profile`, and their former environment settings
 are rejected with `RDL_INVALID`.
+
+Choose `DOCX_REFLOWABLE` when users will add or remove Word text. It deliberately omits PDF-width
+`FitText`, uses Word `atLeast` row heights, and lets long rows continue across physical pages. Its initial
+content comes from the same resolved RDL trace, and before any edit it paginates exactly like the canonical
+PDF, including split rows, continuation labels, and repeated tablix headers: every row publishes the height
+Word actually renders (minimum plus cell margins plus the shared border edge), cell content is budgeted so
+it cannot grow an unedited row, and lines with almost no horizontal slack receive a small measurement
+allowance so Word cannot wrap them. Word pagination may change as content is edited.
+
+Both Word profiles write the RDL page margins as real Word section margins, so Word's print pre-check
+no longer reports zero or negative margins and the report content keeps the same physical positions. Word
+still warns when the RDL margins themselves are smaller than the printer's minimum printable margin.
 
 Choose `DOCX_VISUAL` when editability is unnecessary and a raster page image is acceptable. Choose the
 default XLSX `REPORT` layout for an editable, PDF-styled workbook without PDF pagination. Set
@@ -314,10 +327,10 @@ Excel chart objects, while the surrounding workbook remains editable.
 | Field | Required | Notes |
 | --- | --- | --- |
 | `rdlBase64` | JSON only | The RDL. Multipart uses the `rdl` file part instead. |
-| `output` | ✅ | `PDF` \| `DOCX_EDITABLE` \| `DOCX_VISUAL` \| `XLSX` |
+| `output` | ✅ | `PDF` \| `DOCX_EDITABLE` \| `DOCX_REFLOWABLE` \| `DOCX_VISUAL` \| `XLSX` |
 | `datasets` | ✅ | Object of `datasetName` → array of row objects. |
 | `parameters` | — | Validated against the RDL's declared types and defaults. |
-| `subreports` | — | Render-time bundle of child `rdlBase64` definitions and invocation-scoped parameter/dataset instances. Supported for `PDF`, `DOCX_EDITABLE`, `DOCX_VISUAL`, and XLSX `REPORT`; see [Supplying subreports](./docs/SUBREPORTS.md). |
+| `subreports` | — | Render-time bundle of child `rdlBase64` definitions and invocation-scoped parameter/dataset instances. Supported for `PDF`, `DOCX_EDITABLE`, `DOCX_REFLOWABLE`, `DOCX_VISUAL`, and XLSX `REPORT`; see [Supplying subreports](./docs/SUBREPORTS.md). |
 | `pagination.continuationMarkers` | — | `PDF` and `DOCX_EDITABLE`. When `true`, labels a row whose own content the page break cut where it resumes, with “Continued from previous page”. A page break on its own is never labelled, so a table whose rows all fit carries nothing. Text and on/off come from the `continuation.rowLabel` config. |
 | `excel.layoutMode` | — | `XLSX` only, case-insensitive. `REPORT` (default) or legacy `DATA`. |
 | `excel.sheetPerTablix` | — | `XLSX` DATA mode only. Existing `true` requests without `layoutMode` continue to select DATA automatically. |
