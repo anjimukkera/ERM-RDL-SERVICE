@@ -442,6 +442,37 @@ test('reflowable DOCX reserves Word rule rounding when a ruled grid fills the bo
   assert.ok(rendered >= bandTwips - ruledRows - 2, 'no more than the rounding allowance is given up');
 });
 
+test('page-locked DOCX reserves Word rule rounding before a ruled grid reaches the body boundary', async () => {
+  // Exact Word rows still round ruled horizontal edges upward internally. Without a per-edge allowance
+  // and one twip of boundary slack, a table that fills a section's body band can spill into a second
+  // physical Word page, repeating that section's static footer/page-number text.
+  const ruled = structuredClone(baseModel);
+  ruled.body.items = [];
+  const bodyHeight = baseModel.page.height - baseModel.page.marginTop - baseModel.page.marginBottom;
+  const rowsCount = 20;
+  const rowHeight = bodyHeight / rowsCount;
+  for (let index = 0; index < rowsCount; index += 1) {
+    ruled.body.items.push(withBorders(syntheticTextbox({
+      name: `LockedRuled${index}`, value: `Row ${index}`, left: 7.2, top: index * rowHeight, width: 200, height: rowHeight, canGrow: false,
+    })));
+  }
+  const ruledRequest = { ...request, datasets: { Sales: [{ Name: 'Only', Amount: 1 }] } };
+  const canonical = await renderPdf(ruled, ruledRequest, config, { captureLayoutTrace: true });
+  assert.equal(canonical.pageCount, 1);
+  const page = canonical.layoutTrace.pages[0];
+  const bandTwips = Math.round((page.bodyBottom - page.regions.body.y) * 20);
+  const documentXml = await documentXmlOf(await renderEditableDocx(ruled, { ...ruledRequest, output: 'DOCX_EDITABLE' }, config));
+  const rows = wordTableRows(documentXml)[0];
+  const ruledRows = rows.filter((row) => row.cells.some((cell) => cell.topBorder > 0 || cell.bottomBorder > 0)).length;
+  const rendered = rows.reduce((sum, row, index) => (
+    sum + row.value + (index === rows.length - 1 ? Math.max(...row.cells.map((cell) => cell.bottomBorder)) : 0)
+  ), 0);
+  assert.ok(ruledRows >= rowsCount);
+  assert.ok(rendered <= bandTwips - ruledRows - 1,
+    `page-locked Word grid renders ${rendered} twips; body band is ${bandTwips} with ${ruledRows} ruled rows`);
+  assert.ok(rendered >= bandTwips - ruledRows - 3, 'only the rule rounding allowance is given up');
+});
+
 test('reflowable DOCX renders a body grid closing flush on the body boundary at exactly the band height', async () => {
   // A non-growing textbox whose bottom edge lands exactly on the traced body boundary. The terminal
   // paragraphs are hidden, so the grid may fill the whole band and must not exceed it by a twip.
@@ -459,7 +490,12 @@ test('reflowable DOCX renders a body grid closing flush on the body boundary at 
   const reflowableXml = await documentXmlOf(await renderReflowableDocx(flush, { ...flushRequest, output: 'DOCX_REFLOWABLE' }, config));
   const pageLockedXml = await documentXmlOf(await renderEditableDocx(flush, { ...flushRequest, output: 'DOCX_EDITABLE' }, config));
   const pageLockedRows = wordTableRows(pageLockedXml)[0];
-  assert.equal(pageLockedRows.reduce((sum, row) => sum + row.value, 0), bandTwips, 'the canonical grid fills the body band');
+  const pageLockedRuledRows = pageLockedRows.filter((row) => row.cells.some((cell) => cell.topBorder > 0 || cell.bottomBorder > 0)).length;
+  const pageLockedRendered = pageLockedRows.reduce((sum, row, index) => (
+    sum + row.value + (index === pageLockedRows.length - 1 ? Math.max(...row.cells.map((cell) => cell.bottomBorder)) : 0)
+  ), 0);
+  assert.ok(pageLockedRendered <= bandTwips - pageLockedRuledRows - 1,
+    'the page-locked grid retains Word rule-rounding and boundary slack');
 
   const rows = wordTableRows(reflowableXml)[0];
   const rendered = rows.reduce((sum, row, index) => {

@@ -572,6 +572,55 @@ function rowBottomEdgeTwips(grid, row) {
   return edge;
 }
 
+function openTablixSideAbove(grid, row, column, side) {
+  if (row <= 0 || !['left', 'right'].includes(side)) return null;
+  const item = grid.coverage[row - 1]?.[column]?.item;
+  if (item?.kind !== 'tablixCell' || borderWidth(item, 'bottom') > 0) return null;
+  return borderWidth(item, side) > 0 ? item.borders?.[side] : null;
+}
+
+// A blank native-grid band may occur immediately before, rather than after, a
+// traced tablix continuation.  Preserve a side edge only when there is no
+// horizontal rule separating it from the following cell; otherwise that edge
+// belongs to a different rendered row and must not be bridged.
+function openTablixSideBelow(grid, row, column, side) {
+  if (row >= grid.coverage.length - 1 || !['left', 'right'].includes(side)) return null;
+  const item = grid.coverage[row + 1]?.[column]?.item;
+  if (item?.kind !== 'tablixCell' || borderWidth(item, 'top') > 0) return null;
+  return borderWidth(item, side) > 0 ? item.borders?.[side] : null;
+}
+
+function isTablixFragmentContinuation(owner) {
+  if (owner?.kind !== 'tablixCell' || owner.backgroundColor || String(owner.text || '')) return false;
+  return borderWidth({ borders: owner.fragmentBorders }, 'top') > 0
+    || borderWidth({ borders: owner.fragmentBorders }, 'bottom') > 0;
+}
+
+function unownedTablixFragmentClosingBand(grid, row, column) {
+  const above = grid.coverage[row - 1]?.[column]?.item;
+  const below = grid.coverage[row + 1]?.[column]?.item;
+  // A gap directly before a repeated header belongs to the header's page-local positioning. It is not
+  // a continuation band, even when the tablix fragment itself closes later on the page.
+  // The same is true for a static header: before the first tablix cell on a page there is no edge to
+  // continue, regardless of whether that header is configured to repeat.
+  if (!above || below?.repeatedHeader === true) return false;
+  const adjacent = above || below;
+  if (adjacent?.kind !== 'tablixCell' || !adjacent.tablixName) return false;
+  return grid.lines.some((line) => line.traceRole === RESOLVED_TABLIX_FRAGMENT_BORDER
+    && line.tablixName === adjacent.tablixName
+    && String(line.fragmentSide || '').toLowerCase() === 'bottom');
+}
+
+function adjacentTablixFragmentSide(grid, row, column, side) {
+  for (const item of [grid.coverage[row - 1]?.[column]?.item, grid.coverage[row + 1]?.[column]?.item]) {
+    if (item?.kind !== 'tablixCell' || !item.tablixName || borderWidth(item, side) <= 0) continue;
+    if (grid.lines.some((line) => line.traceRole === RESOLVED_TABLIX_FRAGMENT_BORDER
+      && line.tablixName === item.tablixName
+      && String(line.fragmentSide || '').toLowerCase() === 'bottom')) return item.borders?.[side];
+  }
+  return null;
+}
+
 // One resolved description of a page-grid cell, shared by the Word row arithmetic below and the cell
 // builder so that both see the same margins and borders. Borders, background, and geometry are always
 // resolved against the item's whole traced box, never against the individual band, so a merge cannot
@@ -583,7 +632,35 @@ function cellGeometry(grid, row, column, placement, band = null) {
   const merged = Boolean(band) && band.count > 1;
   const continuation = merged && band.index > 0;
   const box = cellBox(grid, placement ? placement.startRow : row, column, rowSpan, columnSpan);
-  const borders = mergeBandBorders(resolvedCellBorders(box, owner, grid.decorators, grid.lines), band);
+  const renderedBorders = resolvedRenderedBorders(
+    box, owner, grid.decorators, grid.lines,
+  );
+  // Only a fragment-closing, empty tablix cell can be a continuation placeholder. A normal empty
+  // tablix cell can instead be a matrix corner or axis band, where an adjacent open side must end at
+  // the canonical cell boundary rather than extend into that band.
+  if (isTablixFragmentContinuation(owner) || (!owner && unownedTablixFragmentClosingBand(grid, row, column))) {
+    for (const side of ['left', 'right']) {
+      if (borderWidth({ borders: renderedBorders }, side) > 0) continue;
+      renderedBorders[side] = strongerBorder(
+        renderedBorders[side],
+        openTablixSideAbove(grid, row, column, side),
+      );
+      renderedBorders[side] = strongerBorder(
+        renderedBorders[side],
+        openTablixSideBelow(grid, row, column, side),
+      );
+      if (!owner && unownedTablixFragmentClosingBand(grid, row, column)) {
+        renderedBorders[side] = strongerBorder(
+          renderedBorders[side],
+          adjacentTablixFragmentSide(grid, row, column, side),
+        );
+      }
+    }
+  }
+  const borders = mergeBandBorders(Object.fromEntries(Object.entries(renderedBorders).map(([side, border]) => [
+    side,
+    wordBorder(border),
+  ])), band);
   const firstBandTwips = placement
     ? pointsToTwips(grid.yBoundaries[placement.startRow + 1] - grid.yBoundaries[placement.startRow])
     : Infinity;
@@ -1903,15 +1980,23 @@ async function pageTable(
   // height while content a user adds can grow it (see `wordRowPlan`).
   const plan = request.__docxReflowable === true ? wordRowPlan(grid, flowBudgetTwips) : null;
   // Exact rows are published in whole twips, so a grid that closes flush on its band can sum to a twip
-  // or two more than the band itself. Word has no slack left with real margins, so that rounding excess
-  // comes out of the last row (never more than the row can give).
+  // or two more than the band itself. Word also rounds every ruled horizontal edge fractionally upward,
+  // including exact rows. A table which merely reaches the body boundary can therefore create an overflow
+  // page in Word and repeat the current section's footer. Keep the Word rule allowance (and one twip of
+  // boundary slack) in the table, never in the page geometry; the last row gives it up.
   const lastRowIndex = grid.yBoundaries.length - 2;
   let pageLockedRoundingTrim = 0;
   if (!plan && Number.isFinite(flowBudgetTwips)) {
     const total = grid.yBoundaries.slice(1).reduce((sum, value, index) => (
       sum + Math.max(1, pointsToTwips(value - grid.yBoundaries[index]))
     ), 0);
-    pageLockedRoundingTrim = Math.max(0, total - flowBudgetTwips);
+    const ruleRounding = wordRowPlan(grid).rows.reduce((sum, entry) => (
+      sum + entry.roundingTwips
+    ), 0);
+    // A ruled grid must finish before the physical body boundary: Word's internal rounded table height
+    // can otherwise consume every available twip and move the final row to a second physical page.
+    const boundarySlack = ruleRounding > 0 ? 1 : 0;
+    pageLockedRoundingTrim = Math.max(0, total + ruleRounding + boundarySlack - flowBudgetTwips);
   }
   const rows = [];
   for (let row = 0; row < grid.yBoundaries.length - 1; row += 1) {
